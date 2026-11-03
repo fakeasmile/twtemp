@@ -95,6 +95,16 @@ MODEL_PROMPT_SUFFIX = {
     "Qwen3.5-9B": "\n",
 }
 
+# 阶段 1 判是阈值手工表（按模型目录名）。p(是) 是连续量，但不同模型的先验偏移不同
+# （CCC 实测：GLM 偏宽，τ=0.5 时 toxic1 是率 74.6% / toxic0 33.9%；Qwen 整体下移，
+# τ=0.5 只剩 15.0%/1.1%，需 τ=0.1 才回到可比工作点 49.2%/14.7%）。
+# 未登记的模型用默认值 0.5；实际所用 τ 记录在 meta.stage1_tau。
+STAGE1_THRESHOLD = {
+    "glm-4-9b-chat": 0.50,
+    "Qwen3.5-9B": 0.10,
+}
+STAGE1_THRESHOLD_DEFAULT = 0.50
+
 
 # =============================================================================
 # 提示词模板（与 prompt_ring1a_v1.md v2.10 定稿逐字一致）
@@ -355,6 +365,8 @@ def main():
     cat_outputs = all_outputs[n_s1:]
 
     # ---------- 阶段 2：仅阶段 1 判"是" ----------
+    tau = STAGE1_THRESHOLD.get(model_name, STAGE1_THRESHOLD_DEFAULT)
+    print(f"阶段 1 判是阈值 τ = {tau}（模型 {model_name}，表内登记值或默认值）")
     s1_results = {}
     s2_tasks = []
     for (sid, cid), out in zip(s1_keys, s1_outputs):
@@ -362,7 +374,7 @@ def main():
         gen_tok = tokenizer.decode(list(out.outputs[0].token_ids))
         masses, norm = candidate_mass(lp, [yes_ids, no_ids])
         valid = sum(masses) > 0
-        pred_yes = masses[0] > masses[1] if valid else False
+        pred_yes = (norm[0] >= tau) if valid else False
         s1_results[(sid, cid)] = {"p_yes": norm[0], "p_no": norm[1], "pred_yes": pred_yes,
                                   "raw": [round(masses[0], 6), round(masses[1], 6)],
                                   "valid": valid,
@@ -460,6 +472,7 @@ def main():
                 "prompt_version": "ring1a v2.10",
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage2_trigger_rate": round(trigger_rate, 4),
+                "stage1_tau": tau,
                 "concepts": [c["id"] for c in concepts],
             },
             "results": results,
