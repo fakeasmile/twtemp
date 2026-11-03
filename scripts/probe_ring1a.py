@@ -21,10 +21,11 @@ from scripts.run_ring1a import (
     MODEL_PROMPT_SUFFIX,
     STAGE1_TEMPLATE,
     STAGE2_TEMPLATE,
+    candidate_mass,
     detect_chat_kwargs,
-    extract_candidate_probs,
-    get_first_token_ids,
+    get_candidate_ids,
     load_vllm_model,
+    make_mask_processor,
     render_prompts,
 )
 from vllm import SamplingParams
@@ -81,19 +82,23 @@ def main():
     suffix_desc = repr(suffix) if suffix is not None else "未登记，走自动换行修正"
     print(f"[模型 {model_name} 后缀: {suffix_desc}]")
 
-    # verbalizer 候选
+    # verbalizer 候选（按标签分组；同标签的多种表层变体合并求概率质量）
     if MODE == "stage2":
         cand_words, cand_labels = ["A", "B"], ["A", "B"]
     else:
         cand_words, cand_labels = ["是", "否"], ["是", "否"]
-    cand_ids = get_first_token_ids(cand_words, tokenizer)
-    print(f"[verbalizer 候选 token id: {dict(zip(cand_labels, cand_ids))}]")
+    cand_groups = [get_candidate_ids([w], tokenizer) for w in cand_words]
+    all_ids = [tid for g in cand_groups for tid in g]
+    print(f"[verbalizer 候选 token id: "
+          f"{ {label: [tokenizer.decode([t]) for t in g] for label, g in zip(cand_labels, cand_groups)} }]")
 
     print()
     print("=" * 70)
     print("【3】LLM 首 token 输出")
     print("=" * 70)
-    sp = SamplingParams(max_tokens=1, temperature=0, logprobs=20)
+    # 与 run_ring1a.py 一致的受限解码：候选集之外的 logits 掩为 -inf
+    sp = SamplingParams(max_tokens=1, temperature=0, logprobs=50,
+                        logits_processors=[make_mask_processor(all_ids)])
     out = llm.generate([final_prompt], sp, use_tqdm=False)[0]
 
     first_tid = out.outputs[0].token_ids[0]
@@ -105,14 +110,19 @@ def main():
     for tid, obj in top:
         print(f"  {tokenizer.decode([tid])!r:<12} id={tid:<8} p={math.exp(obj.logprob):.6f}")
 
-    raw, norm = extract_candidate_probs(lp, cand_ids)
+    masses, norm = candidate_mass(lp, cand_groups)
+    valid = sum(masses) > 0
     print("verbalizer 归一化概率:")
-    for label, p in zip(cand_labels, norm):
-        print(f"  P({label}) = {p:.6f}")
-    if MODE == "stage1" or MODE == "cat":
-        print(f"判定: {'是' if raw[0] >= raw[1] else '否'}")
+    for label, p, m, g in zip(cand_labels, norm, masses, cand_groups):
+        hit = [t for t in g if t in lp]
+        print(f"  P({label}) = {p:.6f}  原值={m:.6f}  进top-k={bool(hit)}")
+    print(f"判定有效: {valid}")
+    if not valid:
+        print("判定: 无效（候选 token 均未进入 top-k，原值为 0，不能比较）")
+    elif MODE == "stage2":
+        print(f"判定: {'B' if masses[1] > masses[0] else 'A'}")
     else:
-        print(f"判定: {'B' if raw[1] >= raw[0] else 'A'}")
+        print(f"判定: {'是' if masses[0] > masses[1] else '否'}")
 
 
 if __name__ == "__main__":

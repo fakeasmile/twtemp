@@ -1,4 +1,4 @@
-"""环1a 提示词 v2.8 两阶段推理脚本（vLLM 加速，CCC 验证集）。
+"""环1a 提示词 v2.9 两阶段推理脚本（vLLM 加速）。
 
 流程（每次调用 = 一条文本 × 一个判断项，模板取自 data/concepts/prompt_ring1a_v1.md）：
   阶段 1  存在性二值判断（候选 是/否），全部 文本×概念 调用
@@ -10,8 +10,9 @@
 概念来源：data/concepts/cbm_concept_set_v3.csv 中 类别=="环1a 负面评价" 的全部概念。
 
 使用示例：
-  python scripts/run_ring1a.py --model_path D:/models/glm-4-9b-chat
-  python scripts/run_ring1a.py --model_path D:/models/Qwen3.5-9B --gpu_memory_utilization 0.9
+  python scripts/run_ring1a.py --model_path D:/models/glm-4-9b-chat --data_path data/raw/CCC/ccc.json
+  python scripts/run_ring1a.py --model_path D:/models/Qwen3.5-9B --data_path data/raw/TOXICN --split test
+data_path 支持单个 json 文件，或含 train.json/test.json 的目录（--split test|train|all）。
 
 说明（均自动处理，无需命令行指定）：
   首 token 位置修正：优先查代码内 MODEL_PROMPT_SUFFIX 表（按模型目录名手工登记后缀，
@@ -71,6 +72,7 @@ def load_vllm_model(llm_path: Path, gpu_memory_utilization: float):
         max_num_seqs=64,
         max_num_batched_tokens=16384,   # 批量以 prefill 为主（每请求只解码 1 token），大 batched token 提高 GPU 利用率
         enforce_eager=True,             # 只解码 1 个 token，CUDA graph 主要加速多步 decode 循环，此处禁用可省启动时间与显存（腾给 KV cache）
+        max_logprobs=50,                # 与 SamplingParams(logprobs=50) 配套；默认上限 20，候选词可能被截断
     )
     return tokenizer, llm
 
@@ -86,14 +88,16 @@ def detect_chat_kwargs(tokenizer):
 
 # 生成前缀后缀手工指定表（按模型目录名）。不同模型 chat template 结尾不一致，
 # 需要特定后缀的模型在此登记；未登记的模型走自动修正（前缀不以换行结尾则补 '\n'）。
+# Qwen3.5-9B 用 '\n'：首 token 落在裸字母 token（'B'=33 / 'A'=32），A+B 概率质量 0.973，
+# <think> 仅 0.004；改空格后缀会把标签并成 ' B'(417) / ' A'(357)，且 1 空格时 <think> 高达 0.151。
 MODEL_PROMPT_SUFFIX = {
     "glm-4-9b-chat": "\n",
-    "Qwen3.5-9B": " "
+    "Qwen3.5-9B": "\n",
 }
 
 
 # =============================================================================
-# 提示词模板（与 prompt_ring1a_v1.md v2.8 定稿逐字一致）
+# 提示词模板（与 prompt_ring1a_v1.md v2.9 定稿逐字一致）
 # =============================================================================
 STAGE1_TEMPLATE = """你是语言学标注助手。任务：判断文本中是否出现下述判断项。注意：只依据文本中实际出现的内容判断，不评价文本内容对错，不解释。讽刺、委婉、暗示等隐式出现也算出现。
 
@@ -106,7 +110,7 @@ STAGE1_TEMPLATE = """你是语言学标注助手。任务：判断文本中是�
 
 STAGE2_TEMPLATE = """你是语言学标注助手。任务：下述判断项已被确认出现在文本中，现在只判断文本中判断项的强度档位，不要重新判断是否出现。注意：只依据文本中实际出现的内容判断，不评价文本内容对错，不解释。
 强度档位：
-A = 出现但不直接：需要结合上下文才能读出来（如讽刺、委婉、暗示），或被评价的人/群体不明确
+A = 出现但不直接：需要结合上下文才能读出来（如讽刺、委婉、暗示）
 B = 出现且直接：明确出现，且能从原文逐字引出对应片段
 
 文本：{text}
@@ -116,7 +120,8 @@ B = 出现且直接：明确出现，且能从原文逐字引出对应片段
 
 文本中判断项的强度档位？只回答 A/B。回答："""
 
-CAT1A_TEMPLATE = """文本：{text} 对某人或某群体表达了鄙夷、厌恶、敌意、威胁或道德定罪的态度。
+CAT1A_TEMPLATE = """以下文本是否对某人或某群体表达了鄙夷、厌恶、敌意、威胁或道德定罪的态度。
+文本：{text}
 该说法成立吗？
 只回答 是/否。答："""
 
@@ -142,24 +147,60 @@ def load_ring1a_concepts(csv_path: Path):
 # =============================================================================
 # Verbalizer 工具
 # =============================================================================
-def get_first_token_ids(word_list, tokenizer):
+# 候选词的表层变体：不同 tokenizer 会把同一字母切成 "A" / " A" / "Ａ" / "a" 等
+# 不同 token；只取裸形式会在 Qwen 等词表上漏掉实际被采样的那个 token。
+LETTER_VARIANTS = {
+    "A": ["A", " A", "Ａ", "a", " a"],
+    "B": ["B", " B", "Ｂ", "b", " b"],
+    "是": ["是"],
+    "否": ["否"],
+}
+
+
+def get_candidate_ids(word_list, tokenizer):
+    """把若干标签词展开成候选 token id 列表（只接受单 token 形式）。"""
     token_ids = []
     for word in word_list:
-        encoded = tokenizer.encode(word, add_special_tokens=False)
-        if encoded:
-            token_ids.append(encoded[0])
+        for variant in LETTER_VARIANTS.get(word, [word]):
+            encoded = tokenizer.encode(variant, add_special_tokens=False)
+            # 多 token 的变体无法由首 token 表达，跳过（否则会把整词首个 token 当标签）
+            if len(encoded) == 1:
+                token_ids.append(encoded[0])
     token_ids = list(dict.fromkeys(token_ids))
     if not token_ids:
-        raise ValueError("get_first_token_ids ERROR: 词表中无有效 token")
+        raise ValueError("get_candidate_ids ERROR: 词表中无有效候选 token")
     return token_ids
 
 
-def extract_candidate_probs(first_token_logprobs, candidate_ids):
-    """首 token logprobs → 候选 token 概率（未归一化）+ 归一化。"""
-    probs = [math.exp(first_token_logprobs[tid].logprob) if tid in first_token_logprobs else 0.0
-             for tid in candidate_ids]
-    total = sum(probs) + 1e-8
-    return probs, [p / total for p in probs]
+def candidate_mass(first_token_logprobs, id_groups):
+    """把候选按标签分组求和：返回 (每组总概率质量, 归一化后两组概率)。"""
+    masses = [sum(math.exp(first_token_logprobs[t].logprob) for t in g if t in first_token_logprobs)
+              for g in id_groups]
+    total = sum(masses) + 1e-8
+    return masses, [m / total for m in masses]
+
+
+def make_mask_processor(allowed_ids):
+    """受限解码：把候选集之外的 logits 全部掩为 -inf，保证首 token 落在候选上。
+
+    这一步让"首 token 概率"真正等于模型在二选一条件下的后验概率，
+    而不是"模型想说什么"与候选词的偶然重合。
+
+    vLLM 各版本对 logits_processor 的入参签名不一致（(token_ids, logits) 或
+    多参数新式签名），故用 *args 取其中唯一的 logits 张量，避免版本差异导致报错。
+    """
+    allowed = sorted(set(allowed_ids))
+
+    def _processor(*args, **kwargs):
+        import torch
+        logits = kwargs.get("logits")
+        if logits is None:
+            logits = next(a for a in args if isinstance(a, torch.Tensor))
+        masked = torch.full_like(logits, float("-inf"))
+        masked[allowed] = logits[allowed]
+        return masked
+
+    return _processor
 
 
 def render_prompts(tokenizer, texts, chat_kwargs, model_name):
@@ -183,6 +224,50 @@ def render_prompts(tokenizer, texts, chat_kwargs, model_name):
     return prompts
 
 
+def _normalize_sample(item, source_name, split, idx):
+    """统一成内部结构，兼容不同数据集字段差异（COLD 无 platform/expression）。"""
+    return {
+        "id": item.get("id") or f"{source_name}_{split}_{idx:04d}",
+        "source": item.get("source") or source_name,
+        "split": split,
+        "content": item["content"],
+        "toxic": item.get("toxic"),
+        "topic": item.get("topic"),
+        "expression": item.get("expression"),
+        "platform": item.get("platform"),
+    }
+
+
+def load_dataset(data_path: Path, split: str):
+    """data_path 支持两种形态：
+      1) 单个 json 文件（如 data/raw/CCC/ccc.json）——split 置为文件名去后缀；
+      2) 数据集目录（如 data/raw/TOXICN），内含 train.json / test.json；
+         split = test | train | all（all 合并两份）。
+    返回 (样本列表, 实际读取的文件名列表, 数据集标签)。
+    """
+    if not data_path.exists():
+        raise ValueError(f"data_path 不存在: {data_path}")
+
+    if data_path.is_file():
+        items = json.load(open(data_path, "r", encoding="utf-8"))
+        name = data_path.stem
+        return ([_normalize_sample(x, name, name, i) for i, x in enumerate(items)],
+                [data_path.name], data_path.parent.name)
+
+    names = ([n for n in ("train.json", "test.json") if (data_path / n).exists()]
+             if split == "all" else [f"{split}.json"])
+    if not names:
+        raise ValueError(f"{data_path} 下未找到 train.json / test.json")
+    samples = []
+    for n in names:
+        p = data_path / n
+        if not p.exists():
+            raise ValueError(f"{data_path} 下缺少 {n}")
+        items = json.load(open(p, "r", encoding="utf-8"))
+        samples += [_normalize_sample(x, data_path.name, p.stem, i) for i, x in enumerate(items)]
+    return samples, names, data_path.name
+
+
 # =============================================================================
 # 主流程
 # =============================================================================
@@ -190,10 +275,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="环1a 两阶段 + CAT1a vLLM 推理")
     parser.add_argument("--model_path", type=str, required=True,
                         help="模型权重目录（完整路径，如 D:/models/glm-4-9b-chat）")
-    parser.add_argument("--dataset", type=str, default=str(project_root / "data" / "raw" / "CCC" / "ccc.json"))
+    parser.add_argument("--data_path", type=str, required=True,
+                        help="数据集路径：单个 json 文件，或含 train.json/test.json 的目录（如 xxx/TOXICN）")
+    parser.add_argument("--split", type=str, default="test", choices=["test", "train", "all"],
+                        help="目录模式下的划分（单文件模式忽略）")
     parser.add_argument("--concepts_csv", type=str, default=str(project_root / "data" / "concepts" / "cbm_concept_set_v3.csv"))
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="默认 data/processed/CCC/<model_name>/")
+                        help="默认 data/processed/<数据集>/<model_name>/")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     return parser.parse_args()
 
@@ -201,9 +289,9 @@ def parse_args():
 def main():
     args = parse_args()
     model_name = Path(args.model_path).name  # 输出目录/文件名用模型目录名
-    dataset = json.load(open(args.dataset, "r", encoding="utf-8"))
+    dataset, files, dataset_tag = load_dataset(Path(args.data_path), args.split)
     concepts = load_ring1a_concepts(Path(args.concepts_csv))
-    print(f"样本 {len(dataset)} 条 × 概念 {len(concepts)} 个 "
+    print(f"数据集 {dataset_tag}（{', '.join(files)}）样本 {len(dataset)} 条 × 概念 {len(concepts)} 个 "
           f"({'/'.join(c['id'] for c in concepts)})，另加 CAT1a {len(dataset)} 次")
 
     tokenizer, llm = load_vllm_model(
@@ -211,13 +299,18 @@ def main():
     )
     chat_kwargs = detect_chat_kwargs(tokenizer)
 
-    yes_ids = get_first_token_ids(["是"], tokenizer)
-    no_ids = get_first_token_ids(["否"], tokenizer)
-    a_ids = get_first_token_ids(["A"], tokenizer)
-    b_ids = get_first_token_ids(["B"], tokenizer)
+    yes_ids = get_candidate_ids(["是"], tokenizer)
+    no_ids = get_candidate_ids(["否"], tokenizer)
+    a_ids = get_candidate_ids(["A"], tokenizer)
+    b_ids = get_candidate_ids(["B"], tokenizer)
     print(f"verbalizer: 是={yes_ids} 否={no_ids} A={a_ids} B={b_ids}")
 
-    sp = SamplingParams(max_tokens=1, temperature=0, logprobs=20)
+    # 受限解码：每次调用都把 logits 掩到候选集，保证首 token 只可能是候选词，
+    # 首 token 概率因而直接就是二选一条件下的后验概率。
+    sp_yn = SamplingParams(max_tokens=1, temperature=0, logprobs=50,
+                           logits_processors=[make_mask_processor(yes_ids + no_ids)])
+    sp_ab = SamplingParams(max_tokens=1, temperature=0, logprobs=50,
+                           logits_processors=[make_mask_processor(a_ids + b_ids)])
 
     # ---------- 阶段 1 + CAT1a：合并为一次批量调用 ----------
     # 两者互不依赖（阶段 2 才依赖阶段 1），合并成一个 generate 请求批次，
@@ -233,7 +326,7 @@ def main():
     print(f"阶段 1 + CAT1a 推理（合并批量 {n_s1}+{len(cat_prompts)} 条）...")
     all_outputs = llm.generate(
         render_prompts(tokenizer, s1_prompts + cat_prompts, chat_kwargs, model_name),
-        sp, use_tqdm=True)
+        sp_yn, use_tqdm=True)
     s1_outputs = all_outputs[:n_s1]
     cat_outputs = all_outputs[n_s1:]
 
@@ -243,10 +336,14 @@ def main():
     for (sid, cid), out in zip(s1_keys, s1_outputs):
         lp = out.outputs[0].logprobs[0]
         gen_tok = tokenizer.decode(list(out.outputs[0].token_ids))
-        raw, norm = extract_candidate_probs(lp, yes_ids + no_ids)
-        p_yes, p_no = norm[0], norm[1]
-        pred_yes = raw[0] >= raw[1]
-        s1_results[(sid, cid)] = {"p_yes": p_yes, "p_no": p_no, "pred_yes": pred_yes,
+        masses, norm = candidate_mass(lp, [yes_ids, no_ids])
+        valid = sum(masses) > 0
+        pred_yes = masses[0] > masses[1] if valid else False
+        s1_results[(sid, cid)] = {"p_yes": norm[0], "p_no": norm[1], "pred_yes": pred_yes,
+                                  "raw": [round(masses[0], 6), round(masses[1], 6)],
+                                  "valid": valid,
+                                  "topk_hit": [any(t in lp for t in yes_ids),
+                                               any(t in lp for t in no_ids)],
                                   "gen_token": gen_tok}
         if pred_yes:
             sample = next(s for s in dataset if s["id"] == sid)
@@ -261,21 +358,29 @@ def main():
     if s2_tasks:
         s2_outputs = llm.generate(
             render_prompts(tokenizer, [t[2] for t in s2_tasks], chat_kwargs, model_name),
-            sp, use_tqdm=True)
+            sp_ab, use_tqdm=True)
         for (sid, cid, _), out in zip(s2_tasks, s2_outputs):
             lp = out.outputs[0].logprobs[0]
             gen_tok = tokenizer.decode(list(out.outputs[0].token_ids))
-            raw, norm = extract_candidate_probs(lp, a_ids + b_ids)
+            masses, norm = candidate_mass(lp, [a_ids, b_ids])
+            valid = sum(masses) > 0
             s2_results[(sid, cid)] = {"p_A": norm[0], "p_B": norm[1],
-                                      "pred_B": raw[1] >= raw[0],
+                                      "pred_B": (masses[1] > masses[0]) if valid else False,
+                                      "raw": [round(masses[0], 6), round(masses[1], 6)],
+                                      "valid": valid,
+                                      "topk_hit": [any(t in lp for t in a_ids),
+                                                   any(t in lp for t in b_ids)],
                                       "gen_token": gen_tok}
 
     # ---------- 汇总与映射 ----------
     results = []
     for sample, cat_out in zip(dataset, cat_outputs):
         lp = cat_out.outputs[0].logprobs[0]
-        _, cat_norm = extract_candidate_probs(lp, yes_ids + no_ids)
+        cat_masses, cat_norm = candidate_mass(lp, [yes_ids, no_ids])
         cat = {"p_yes": cat_norm[0], "p_no": cat_norm[1],
+               "raw": [round(cat_masses[0], 6), round(cat_masses[1], 6)],
+               "valid": sum(cat_masses) > 0,
+               "topk_hit": [any(t in lp for t in yes_ids), any(t in lp for t in no_ids)],
                "gen_token": tokenizer.decode(list(cat_out.outputs[0].token_ids))}
 
         concept_values, entry_concepts = {}, {}
@@ -284,8 +389,9 @@ def main():
             s2 = s2_results.get((sample["id"], c["id"]))
             if not s1["pred_yes"]:
                 value = 0
-            elif s2 is None:
-                value = 0  # 不应发生
+            elif s2 is None or not s2["valid"]:
+                # 阶段 1 已确认存在，强度没测出时保守取 1，不默认成 B
+                value = 1
             else:
                 value = 2 if s2["pred_B"] else 1
             concept_values[c["id"]] = value
@@ -299,10 +405,12 @@ def main():
         results.append({
             "id": sample["id"],
             "source": sample["source"],
+            "split": sample["split"],
             "content": sample["content"],
             "toxic": sample["toxic"],
             "topic": sample.get("topic"),
             "expression": sample.get("expression"),
+            "platform": sample.get("platform"),
             "concepts": entry_concepts,
             "ring1a_max_value": max_value,
             "ring1a_confirmed": max_value >= 1,
@@ -313,7 +421,7 @@ def main():
     if args.output_dir:
         out_dir = Path(args.output_dir)
     else:
-        out_dir = project_root / "data" / "processed" / "CCC" / model_name
+        out_dir = project_root / "data" / "processed" / dataset_tag / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"ring1a_{model_name}.json"
     with open(json_path, "w", encoding="utf-8") as f:
@@ -321,8 +429,11 @@ def main():
             "meta": {
                 "model": model_name,
                 "model_path": str(args.model_path),
-                "prompt_version": "ring1a v2.8",
-                "dataset": args.dataset,
+                "data_path": str(args.data_path),
+                "files": files,
+                "split": args.split,
+                "n_samples": len(dataset),
+                "prompt_version": "ring1a v2.9",
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage2_trigger_rate": round(trigger_rate, 4),
                 "concepts": [c["id"] for c in concepts],
@@ -334,16 +445,17 @@ def main():
     csv_path = out_dir / f"ring1a_{model_name}_flat.csv"
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["id", "source", "toxic", "expression", "concept",
-                    "p_yes", "stage1_pred", "stage1_gen", "p_B", "stage2_gen", "value",
+        w.writerow(["id", "source", "split", "toxic", "expression", "concept",
+                    "p_yes", "stage1_pred", "stage1_gen", "p_B", "stage2_gen", "stage2_valid", "value",
                     "ring1a_max", "ring1a_confirmed", "CAT1a_p_yes", "CAT1a_gen", "content"])
         for r in results:
             for cid, e in r["concepts"].items():
-                w.writerow([r["id"], r["source"], r["toxic"], r.get("expression"), cid,
+                w.writerow([r["id"], r["source"], r["split"], r["toxic"], r.get("expression"), cid,
                             round(e["stage1"]["p_yes"], 4), int(e["stage1"]["pred_yes"]),
                             e["stage1"]["gen_token"],
                             round(e["stage2"]["p_B"], 4) if e["stage2"] else "",
                             e["stage2"]["gen_token"] if e["stage2"] else "",
+                            int(e["stage2"]["valid"]) if e["stage2"] else "",
                             e["value"], r["ring1a_max_value"], int(r["ring1a_confirmed"]),
                             round(r["CAT1a"]["p_yes"], 4), r["CAT1a"]["gen_token"], r["content"]])
 
@@ -365,6 +477,15 @@ def main():
     off_s2 = sum(1 for v in s2_results.values() if v["gen_token"].strip() not in ("A", "B"))
     off_cat = sum(1 for r in results if r["CAT1a"]["gen_token"].strip() not in ("是", "否"))
     print(f"首token越界: 阶段1 {off_s1}/{len(s1_results)}  阶段2 {off_s2}/{len(s2_results)}  CAT1a {off_cat}/{len(results)}")
+    # 候选未进 top-k 监控：任一候选缺失则说明归一化读数失真
+    miss_s1 = sum(1 for v in s1_results.values() if not all(v["topk_hit"]))
+    miss_s2 = sum(1 for v in s2_results.values() if not all(v["topk_hit"]))
+    miss_cat = sum(1 for r in results if not all(r["CAT1a"]["topk_hit"]))
+    # 无效判定监控：受限解码后应为 0；非 0 说明 logits_processors 未生效
+    inv_s1 = sum(1 for v in s1_results.values() if not v["valid"])
+    inv_s2 = sum(1 for v in s2_results.values() if not v["valid"])
+    inv_cat = sum(1 for r in results if not r["CAT1a"]["valid"])
+    print(f"无效判定: 阶段1 {inv_s1}/{len(s1_results)}  阶段2 {inv_s2}/{len(s2_results)}  CAT1a {inv_cat}/{len(results)}")
     print(f"输出: {json_path}\n      {csv_path}")
 
 
