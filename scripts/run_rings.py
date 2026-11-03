@@ -371,6 +371,8 @@ def main():
                 # 换机器跑（本地/服务器）时用它核对两侧 CSV 是否同一份。
                 "concepts_csv_md5": hashlib.md5(
                     Path(args.concepts_csv).read_bytes()).hexdigest(),
+                # 定义原文快照：结果里直接可查当时用的每条定义，杜绝版本歧义
+                "definitions": {c["id"]: c["definition"] for c in concepts},
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage1_tau": tau,
                 "cat_taus": cat_taus,
