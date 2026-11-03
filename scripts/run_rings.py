@@ -40,8 +40,11 @@ from run_ring1a import (  # noqa: E402  复用 1a 已验证的机制，不复制
 
 
 # =============================================================================
-# 提示词模板（rings v1.2；v1.1→v1.2 模板与定义未动，仅 CSV 环3 guard 角色改 descriptive
-# ——ring_spec v3.4：环3 C5a/b/c、C6a/b 降为描述性维度，不参与阻断，环3 确认 = evidence≥1。
+# 提示词模板（rings v1.3 定稿；v1.2→v1.3 模板与定义未动，仅登记阈值表：
+# CAT_TAU / GUARD_TAU = analyze_rings.py 6c 统一校准（Youden's J）在 CCC 试点上的程序输出，
+# 落 meta.cat_taus / meta.guard_tau。
+# v1.1→v1.2 仅改 CSV 环3 guard 角色为 descriptive——ring_spec v3.4：环3 C5a/b/c、C6a/b 降为
+# 描述性维度，不参与阻断，环3 确认 = evidence≥1。
 # v1.0→v1.1 仅改 CSV 定义：环3 及 U4a/U4b 定义补"贬损存在"前提，C5b/C5c/U4a/E6a 加排除语，
 # U1/U2 删首token架构不可执行的括号注）
 # =============================================================================
@@ -131,10 +134,17 @@ FULLWIDTH_DIGITS = {"0": "０", "1": "１", "2": "２", "3": "３", "4": "４", 
 for _d, _fw in FULLWIDTH_DIGITS.items():
     LETTER_VARIANTS[_d] = [_d, f" {_d}", _fw, f" {_fw}"]
 
-# CAT 判是阈值手工表（按模型目录名），待 ccc.json 试点扫描后登记；未登记用默认 0.50。
-# 结构同 1a 的 CAT1A_THRESHOLD：{"模型名": {τ}}，实际所用值记录在 meta.cat_taus。
-CAT_TAU = {name: {} for name in CAT_TEMPLATES}
+# CAT/GUARD 判是阈值登记表（按模型目录名）。数值 = analyze_rings.py 6c 统一校准（Youden's J）
+# 在 CCC 试点上的程序输出（2026-11-03 登记），非手工拍定；未登记的模型/通道用默认 0.50。
+# 实际所用值记录在 meta.cat_taus / meta.guard_tau；正式实验需在独立校准集上重新校准（挂账）。
+CAT_TAU = {
+    "glm-4-9b-chat": {"CAT1B": 0.94, "CAT2A": 0.92, "CAT2B": 0.94, "CAT3": 0.96, "CAT4": 0.92},
+    "Qwen3.5-9B":    {"CAT1B": 0.14, "CAT2A": 0.12, "CAT2B": 0.50, "CAT3": 0.34, "CAT4": 0.22},
+}
 CAT_TAU_DEFAULT = 0.50
+# 环4 guard 阻断阈值：任一 guard 概念 p(是) ≥ τ_guard 即阻断（环3 guard 已降级 descriptive，不阻断）。
+GUARD_TAU = {"glm-4-9b-chat": 0.74, "Qwen3.5-9B": 0.10}
+GUARD_TAU_DEFAULT = 0.50
 
 
 # =============================================================================
@@ -312,9 +322,11 @@ def main():
         }
 
     # ---------- 汇总 ----------
-    cat_taus = {name: CAT_TAU.get(name, {}).get(model_name, CAT_TAU_DEFAULT)
+    cat_taus = {name: CAT_TAU.get(model_name, {}).get(name, CAT_TAU_DEFAULT)
                 for name in CAT_TEMPLATES}
-    print("CAT 判是阈值 τ = " + ", ".join(f"{k}:{v}" for k, v in cat_taus.items()))
+    guard_tau = GUARD_TAU.get(model_name, GUARD_TAU_DEFAULT)
+    print("CAT 判是阈值 τ = " + ", ".join(f"{k}:{v}" for k, v in cat_taus.items())
+          + f" | 环4 guard 阻断 τ = {guard_tau}")
     results = []
     for sample in dataset:
         sid = sample["id"]
@@ -369,10 +381,11 @@ def main():
                 "files": files,
                 "split": args.split,
                 "n_samples": len(dataset),
-                "prompt_version": "rings v1.2",
+                "prompt_version": "rings v1.3",
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage1_tau": tau,
                 "cat_taus": cat_taus,
+                "guard_tau": guard_tau,
                 "concepts": [{"id": c["id"], "ring": c["ring"], "role": c["role"],
                               "range": c["range"]} for c in concepts],
                 "stage2_trigger_rate": round(len(s2_tasks) / max(1, len(s1_results)), 4),
