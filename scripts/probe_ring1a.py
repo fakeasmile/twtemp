@@ -21,14 +21,13 @@ from scripts.run_ring1a import (
     MODEL_PROMPT_SUFFIX,
     STAGE1_TEMPLATE,
     STAGE2_TEMPLATE,
+    build_sampling_params,
     candidate_mass,
     detect_chat_kwargs,
     get_candidate_ids,
     load_vllm_model,
-    make_mask_processor,
     render_prompts,
 )
-from vllm import SamplingParams
 
 # =============================================================================
 # CONFIG —— 只改这里
@@ -96,9 +95,8 @@ def main():
     print("=" * 70)
     print("【3】LLM 首 token 输出")
     print("=" * 70)
-    # 与 run_ring1a.py 一致的受限解码：候选集之外的 logits 掩为 -inf
-    sp = SamplingParams(max_tokens=1, temperature=0, logprobs=50,
-                        logits_processors=[make_mask_processor(all_ids)])
+    # 与 run_ring1a.py 一致的受限解码：候选集之外的 token 被屏蔽
+    sp = build_sampling_params(all_ids)
     out = llm.generate([final_prompt], sp, use_tqdm=False)[0]
 
     first_tid = out.outputs[0].token_ids[0]

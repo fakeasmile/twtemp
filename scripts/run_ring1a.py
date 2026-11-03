@@ -203,6 +203,33 @@ def make_mask_processor(allowed_ids):
     return _processor
 
 
+def build_sampling_params(allowed_ids):
+    """构造"首 token 只能是候选"的采样参数，按 vLLM 版本自动降级：
+
+    1) logits_processors（自定义掩码，各版本入参签名已用 *args 兼容）
+    2) allowed_token_ids（vLLM 原生的候选白名单，新版移除 logits_processors 后的替代）
+    3) 都不支持时不加约束——此时候选若不在 top-k，判定记为无效（不猜）
+
+    2) 与 1) 在数学上等价：都等价于在候选集上做条件归一化。
+    """
+    allowed = sorted(set(allowed_ids))
+    candidates = [
+        ("logits_processors", {"logits_processors": [make_mask_processor(allowed)]}),
+        ("allowed_token_ids", {"allowed_token_ids": allowed}),
+        ("无约束", {}),
+    ]
+    for name, extra in candidates:
+        try:
+            sp = SamplingParams(max_tokens=1, temperature=0, logprobs=50, **extra)
+        except TypeError as e:
+            print(f"受限解码 {name} 不可用（{e}），尝试下一种")
+            continue
+        print(f"受限解码方式: {name}，候选 id = {allowed}")
+        return sp
+    raise RuntimeError("当前 vLLM 既不支持 logits_processors 也不支持 allowed_token_ids，"
+                       "无法约束首 token 到候选集")
+
+
 def render_prompts(tokenizer, texts, chat_kwargs, model_name):
     """texts: 已填槽的完整模板字符串列表 → chat template 后的 prompt 列表。
 
@@ -305,12 +332,10 @@ def main():
     b_ids = get_candidate_ids(["B"], tokenizer)
     print(f"verbalizer: 是={yes_ids} 否={no_ids} A={a_ids} B={b_ids}")
 
-    # 受限解码：每次调用都把 logits 掩到候选集，保证首 token 只可能是候选词，
-    # 首 token 概率因而直接就是二选一条件下的后验概率。
-    sp_yn = SamplingParams(max_tokens=1, temperature=0, logprobs=50,
-                           logits_processors=[make_mask_processor(yes_ids + no_ids)])
-    sp_ab = SamplingParams(max_tokens=1, temperature=0, logprobs=50,
-                           logits_processors=[make_mask_processor(a_ids + b_ids)])
+    # 受限解码：每次调用都把候选集之外的 token 屏蔽，保证首 token 只可能是候选词，
+    # 首 token 概率因而直接就是二选一条件下的后验概率（具体走哪条 API 见打印）。
+    sp_yn = build_sampling_params(yes_ids + no_ids)
+    sp_ab = build_sampling_params(a_ids + b_ids)
 
     # ---------- 阶段 1 + CAT1a：合并为一次批量调用 ----------
     # 两者互不依赖（阶段 2 才依赖阶段 1），合并成一个 generate 请求批次，
