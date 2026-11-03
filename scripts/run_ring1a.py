@@ -21,7 +21,7 @@
 
 性能设定（针对 32G vGPU + 只要首 token 的负载）：
   每请求 max_tokens=1，负载以 prefill 为主：enforce_eager 省 CUDA graph 显存与启动时间、
-  swap_space=0、prefix caching 开、阶段 1 与 CAT1a 合并单次批量调用、阶段 2 一次批量调用。
+  prefix caching 开、阶段 1 与 CAT1a 合并单次批量调用、阶段 2 一次批量调用。
   全程共 2 次 llm.generate 往返。9B bf16 权重约 18G，0.85 利用率下 KV 约 9G，
   单模型一次装不下可降 --gpu_memory_utilization 前先确认无其他进程占卡。
   不启用量化：量化改变 logits 分布，影响概率读数效度（测量类任务不可妥协）。
@@ -71,7 +71,6 @@ def load_vllm_model(llm_path: Path, gpu_memory_utilization: float):
         max_num_seqs=64,
         max_num_batched_tokens=16384,   # 批量以 prefill 为主（每请求只解码 1 token），大 batched token 提高 GPU 利用率
         enforce_eager=True,             # 只解码 1 个 token，CUDA graph 主要加速多步 decode 循环，此处禁用可省启动时间与显存（腾给 KV cache）
-        swap_space=0,                   # 无长序列换出需求
     )
     return tokenizer, llm
 

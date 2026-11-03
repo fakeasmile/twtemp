@@ -32,7 +32,7 @@ from vllm import SamplingParams
 # =============================================================================
 # CONFIG —— 只改这里
 # =============================================================================
-MODEL_PATH = "D:/models/glm-4-9b-chat"   # 模型权重目录
+MODEL_PATH = "/root/autodl-tmp/glm-4-9b-chat"   # 模型权重目录
 MODE = "stage1"                          # stage1 | stage2 | cat
 GPU_MEMORY_UTILIZATION = 0.85            # 显存占用比例
 
