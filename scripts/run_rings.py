@@ -40,7 +40,8 @@ from run_ring1a import (  # noqa: E402  复用 1a 已验证的机制，不复制
 
 
 # =============================================================================
-# 提示词模板（rings v1.0）
+# 提示词模板（rings v1.1；v1.0→v1.1 仅改 CSV 定义，模板未动：
+# 环3 及 U4a/U4b 定义补"贬损存在"前提，C5b/C5c/U4a/E6a 加排除语，U1/U2 删首token架构不可执行的括号注）
 # =============================================================================
 STAGE1_TEMPLATE = """你是语言学标注助手。判断文本中是否出现下述判断项。只依据文本本身判断，不评价内容对错，不解释。判断项以讽刺、委婉、谐音、缩写等变形出现同样算。
 
@@ -363,7 +364,7 @@ def main():
                 "files": files,
                 "split": args.split,
                 "n_samples": len(dataset),
-                "prompt_version": "rings v1.0",
+                "prompt_version": "rings v1.1",
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage1_tau": tau,
                 "cat_taus": cat_taus,
