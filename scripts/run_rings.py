@@ -22,7 +22,6 @@ data_path 支持单个 json 文件，或含 train.json/test.json 的目录（--s
 
 import argparse
 import csv
-import hashlib
 import json
 import sys
 from datetime import datetime
@@ -151,7 +150,10 @@ def load_ring_concepts(csv_path: Path):
     """读取除 环1a 与 S1 外的全部概念，保留类别/角色/值域（决定是否走阶段 2）。"""
     concepts = []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        # 传输环节可能在表头引入多余 BOM/NUL（曾出现双重 BOM 致 KeyError），统一剥掉
+        reader.fieldnames = [(fn or "").lstrip("\ufeff\x00").strip() for fn in reader.fieldnames]
+        for row in reader:
             cat = row["类别"].strip()
             if cat not in RING_KEY:
                 continue
@@ -366,13 +368,6 @@ def main():
                 "split": args.split,
                 "n_samples": len(dataset),
                 "prompt_version": "rings v1.1",
-                "concepts_csv": str(args.concepts_csv),
-                # 防呆：记录定义文件指纹。同版本号但 md5 不同 = 定义被改过未升版本；
-                # 换机器跑（本地/服务器）时用它核对两侧 CSV 是否同一份。
-                "concepts_csv_md5": hashlib.md5(
-                    Path(args.concepts_csv).read_bytes()).hexdigest(),
-                # 定义原文快照：结果里直接可查当时用的每条定义，杜绝版本歧义
-                "definitions": {c["id"]: c["definition"] for c in concepts},
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage1_tau": tau,
                 "cat_taus": cat_taus,
