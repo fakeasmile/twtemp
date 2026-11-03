@@ -1,4 +1,4 @@
-"""环1a 提示词 v2.10 两阶段推理脚本（vLLM 加速）。
+"""环1a 提示词 v2.11 两阶段推理脚本（vLLM 加速）。
 
 流程（每次调用 = 一条文本 × 一个判断项，模板取自 data/concepts/prompt_ring1a_v1.md）：
   阶段 1  存在性二值判断（候选 是/否），全部 文本×概念 调用
@@ -105,9 +105,18 @@ STAGE1_THRESHOLD = {
 }
 STAGE1_THRESHOLD_DEFAULT = 0.50
 
+# CAT1a 判是阈值手工表（按模型目录名）。CAT 问句与概念问句措辞独立，但同样受模型级
+# 概率偏移影响（CCC 实测 5b 扫描：Qwen τ=0.2 的工作点 66%/87.5%/51.7% 与 GLM τ=0.5
+# 的 69%/95%/51.7% 逐项对齐；Qwen 的 CAT 连续分离度仅 1.7×，弱于其阶段 1 的 4×）。
+CAT1A_THRESHOLD = {
+    "glm-4-9b-chat": 0.50,
+    "Qwen3.5-9B": 0.20,
+}
+CAT1A_THRESHOLD_DEFAULT = 0.50
+
 
 # =============================================================================
-# 提示词模板（与 prompt_ring1a_v1.md v2.10 定稿逐字一致）
+# 提示词模板（与 prompt_ring1a_v1.md v2.11 定稿逐字一致）
 # =============================================================================
 STAGE1_TEMPLATE = """你是语言学标注助手。判断文本中是否出现下述判断项。只依据文本本身判断，不评价内容对错，不解释。判断项以讽刺、委婉、谐音、缩写等变形出现同样算。
 
@@ -129,9 +138,9 @@ B = 直接出现：文本字面内容本身就是判断项，无需结合上下�
 
 判断项是直接出现（B）还是间接出现（A）？只回答 A/B。回答："""
 
-CAT1A_TEMPLATE = """以下文本是否对某人或某群体表达了鄙夷、厌恶、敌意、威胁或道德定罪的态度。
+CAT1A_TEMPLATE = """以下文本是否包含对某人或某群体的负面态度表达（鄙夷、厌恶、敌意、威胁、道德定罪）。
 文本：{text}
-该说法成立吗？
+文本中有这类表达吗？
 只回答 是/否。答："""
 
 
@@ -410,10 +419,13 @@ def main():
 
     # ---------- 汇总与映射 ----------
     results = []
+    cat_tau = CAT1A_THRESHOLD.get(model_name, CAT1A_THRESHOLD_DEFAULT)
+    print(f"CAT1a 判是阈值 τ = {cat_tau}（模型 {model_name}，表内登记值或默认值）")
     for sample, cat_out in zip(dataset, cat_outputs):
         lp = cat_out.outputs[0].logprobs[0]
         cat_masses, cat_norm = candidate_mass(lp, [yes_ids, no_ids])
         cat = {"p_yes": cat_norm[0], "p_no": cat_norm[1],
+               "pred_yes": (cat_norm[0] >= cat_tau) if sum(cat_masses) > 0 else False,
                "raw": [round(cat_masses[0], 6), round(cat_masses[1], 6)],
                "valid": sum(cat_masses) > 0,
                "topk_hit": [any(t in lp for t in yes_ids), any(t in lp for t in no_ids)],
@@ -469,10 +481,11 @@ def main():
                 "files": files,
                 "split": args.split,
                 "n_samples": len(dataset),
-                "prompt_version": "ring1a v2.10",
+                "prompt_version": "ring1a v2.11",
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage2_trigger_rate": round(trigger_rate, 4),
                 "stage1_tau": tau,
+                "cat_tau": cat_tau,
                 "concepts": [c["id"] for c in concepts],
             },
             "results": results,
