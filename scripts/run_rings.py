@@ -15,10 +15,14 @@ run_ring1a.py 保留作先导实验脚本，不再用于正式数据生成。
 映射：阶段1"否"→0，阶段2 A→1、B→2；0-1 概念 是→1；S1 取 argmax 数字。
 环确认聚合（DINO 析取 / guard 压制逻辑）放在 analyze_rings.py，本脚本只落 raw p 与值。
 
+输出命名（防覆盖）：输出文件名带数据来源后缀——
+  data_path 指向单个 json 文件 → rings_{model_name}_{文件名去后缀}.json / ..._flat.csv
+  data_path 指向目录（--split test|train）→ rings_{model_name}_{split}.json / ..._flat.csv
+  目录模式分两次跑（先 test 后 train）会得到两个文件，天然不覆盖；不再提供 all 模式。
+
 使用示例：
   python scripts/run_rings.py --model_path D:/models/glm-4-9b-chat --data_path data/raw/CCC/ccc.json
-  python scripts/run_rings.py --model_path D:/models/Qwen3.5-9B --data_path data/raw/CCC/ccc.json
-data_path 支持单个 json 文件，或含 train.json/test.json 的目录（--split test|train|all）。
+  python scripts/run_rings.py --model_path D:/models/Qwen3.5-9B --data_path data/raw/TOXICN --split test
 """
 
 import argparse
@@ -200,8 +204,8 @@ def parse_args():
                         help="模型权重目录（完整路径，如 D:/models/glm-4-9b-chat）")
     parser.add_argument("--data_path", type=str, required=True,
                         help="数据集路径：单个 json 文件，或含 train.json/test.json 的目录")
-    parser.add_argument("--split", type=str, default="test", choices=["test", "train", "all"],
-                        help="目录模式下的划分（单文件模式忽略）")
+    parser.add_argument("--split", type=str, default="test", choices=["test", "train"],
+                        help="目录模式下的划分（单文件模式忽略；单文件模式文件名进输出名）")
     parser.add_argument("--concepts_csv", type=str,
                         default=str(project_root / "data" / "concepts" / "cbm_concept_set_v3.csv"))
     parser.add_argument("--output_dir", type=str, default=None,
@@ -379,7 +383,11 @@ def main():
     out_dir = (Path(args.output_dir) if args.output_dir
                else project_root / "data" / "processed" / dataset_tag / model_name)
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"rings_{model_name}.json"
+    # 输出名带数据来源后缀，防两次运行互相覆盖：
+    #   单文件模式 → 文件名去后缀（如 ccc）；目录模式 → split（test/train）
+    name_suffix = (Path(args.data_path).stem if Path(args.data_path).is_file()
+                   else args.split)
+    json_path = out_dir / f"rings_{model_name}_{name_suffix}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({
             "meta": {
@@ -402,7 +410,7 @@ def main():
         }, f, ensure_ascii=False, indent=4)
 
     # 扁平 CSV（WPS 审阅用）
-    csv_path = out_dir / f"rings_{model_name}_flat.csv"
+    csv_path = out_dir / f"rings_{model_name}_{name_suffix}_flat.csv"
     cat_names = list(CAT_TEMPLATES)
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
