@@ -1,18 +1,19 @@
-"""剩余四环（1b/2/3/4）+ S1 提示词 v1.0 推理脚本（vLLM 加速）。
+"""全概念（环1a/1b/2/3/4）+ S1 提示词 v1.4 推理脚本（vLLM 加速）。
 
 与 run_ring1a.py 同一套机制（单概念两阶段 + 首 token verbalizer 提取 + 受限解码），
-直接复用其模型加载、渲染与提取工具（import，不改动 1a 脚本）。
+直接复用其模型加载、渲染与提取工具（import，不改动 1a 脚本；CAT1a 模板/阈值同源 import）。
+v1.4 起：环1a 的 6 个概念与 CAT1a 并入本脚本——只跑本脚本即可得到完整概念向量；
+run_ring1a.py 保留作先导实验脚本，不再用于正式数据生成。
 
 每次调用 = 一条文本 × 一个判断项：
-  阶段 1  存在性（是/否）：除环1a 外的全部概念（环1b 3 个、环2 6 个、环3 12 个、环4 8 个）
+  阶段 1  存在性（是/否）：全部 35 个概念（环1a 6、环1b 3、环2 6、环3 12、环4 8）
           0-1 值域概念只走阶段 1；0-2 值域概念在判"是"后触发阶段 2（A/B 对称定义）
   环4     概念模板首句替换为角色框架（熟悉网络社群用语的标注助手），其余与 1a 一字不差
-  CAT     每条文本 5 问：CAT1b / CAT2a（含"话题提及不算"排除语）/ CAT2b（不含）/ CAT3 / CAT4
-          CAT2 双变体用于决策排除语去留；全部为出现性锚定问法（v2.11 经验）
+  CAT     每条文本 6 问：CAT1a / CAT1b / CAT2a（含"话题提及不算"排除语）/ CAT2b（不含）/ CAT3 / CAT4
   S1      严重度 ordinal 0-5，单次调用，首 token 在数字 0-5 上提质量，双变体：
           S1A 无例词 / S1B 定义带例词（决策例词去留）
 映射：阶段1"否"→0，阶段2 A→1、B→2；0-1 概念 是→1；S1 取 argmax 数字。
-环确认聚合（guard 压制逻辑）放在 analyze_rings.py，本脚本只落 raw p 与值。
+环确认聚合（DINO 析取 / guard 压制逻辑）放在 analyze_rings.py，本脚本只落 raw p 与值。
 
 使用示例：
   python scripts/run_rings.py --model_path D:/models/glm-4-9b-chat --data_path data/raw/CCC/ccc.json
@@ -36,11 +37,14 @@ from run_ring1a import (  # noqa: E402  复用 1a 已验证的机制，不复制
     build_sampling_params, candidate_mass, detect_chat_kwargs,
     get_candidate_ids, load_dataset, load_vllm_model, render_prompts,
     LETTER_VARIANTS, STAGE1_THRESHOLD, STAGE1_THRESHOLD_DEFAULT,
+    CAT1A_TEMPLATE,
 )
 
 
 # =============================================================================
-# 提示词模板（rings v1.3 定稿；v1.2→v1.3 模板与定义未动，仅登记阈值表：
+# 提示词模板（rings v1.4 定稿；v1.3→v1.4 环1a 并入：CSV 环1a 6 概念与 CAT1a 进入本脚本，
+# CAT1A_TEMPLATE 从 run_ring1a 同源 import 保证与先导实验逐字一致，模板与定义未动。
+# v1.2→v1.3 模板与定义未动，仅登记阈值表：
 # CAT_TAU / GUARD_TAU = analyze_rings.py 6c 统一校准（Youden's J）在 CCC 试点上的程序输出，
 # 落 meta.cat_taus / meta.guard_tau。
 # v1.1→v1.2 仅改 CSV 环3 guard 角色为 descriptive——ring_spec v3.4：环3 C5a/b/c、C6a/b 降为
@@ -75,6 +79,8 @@ STAGE2_TEMPLATE_U = STAGE2_TEMPLATE.replace(
     "你是语言学标注助手。", "你是熟悉网络社群用语的标注助手。", 1)
 
 CAT_TEMPLATES = {
+    # CAT1a 模板从 run_ring1a 同源 import（先导实验 v2.11 定稿原文），此处不重复定义。
+    "CAT1A": CAT1A_TEMPLATE,
     # 原 CSV 问句"该文本是否通过保护、角色限定或地位贬低，把人或群体固定到从属/较低的位置？"
     # 为机制归因式，改出现性锚定。
     "CAT1B": """以下文本是否包含把人或群体固定到从属、较低位置的表达（以保护、角色限定或地位贬低的方式）。
@@ -138,8 +144,9 @@ for _d, _fw in FULLWIDTH_DIGITS.items():
 # 在 CCC 试点上的程序输出（2026-11-03 登记），非手工拍定；未登记的模型/通道用默认 0.50。
 # 实际所用值记录在 meta.cat_taus / meta.guard_tau；正式实验需在独立校准集上重新校准（挂账）。
 CAT_TAU = {
-    "glm-4-9b-chat": {"CAT1B": 0.94, "CAT2A": 0.92, "CAT2B": 0.94, "CAT3": 0.96, "CAT4": 0.92},
-    "Qwen3.5-9B":    {"CAT1B": 0.14, "CAT2A": 0.12, "CAT2B": 0.50, "CAT3": 0.34, "CAT4": 0.22},
+    # CAT1A = 环1a 时期登记值（run_ring1a.CAT1A_THRESHOLD），非 6c 输出
+    "glm-4-9b-chat": {"CAT1A": 0.50, "CAT1B": 0.94, "CAT2A": 0.92, "CAT2B": 0.94, "CAT3": 0.96, "CAT4": 0.92},
+    "Qwen3.5-9B":    {"CAT1A": 0.10, "CAT1B": 0.14, "CAT2A": 0.12, "CAT2B": 0.50, "CAT3": 0.34, "CAT4": 0.22},
 }
 CAT_TAU_DEFAULT = 0.50
 # 环4 guard 阻断阈值：任一 guard 概念 p(是) ≥ τ_guard 即阻断（环3 guard 已降级 descriptive，不阻断）。
@@ -151,6 +158,7 @@ GUARD_TAU_DEFAULT = 0.50
 # 概念词典
 # =============================================================================
 RING_KEY = {
+    "环1a 负面评价": "ring1a",
     "环1b 限制性/等级化评价": "ring1b",
     "环2 身份锚定": "ring2",
     "环3 立场承诺": "ring3",
@@ -159,7 +167,7 @@ RING_KEY = {
 
 
 def load_ring_concepts(csv_path: Path):
-    """读取除 环1a 与 S1 外的全部概念，保留类别/角色/值域（决定是否走阶段 2）。"""
+    """读取除 S1 外的全部概念（含环1a），保留类别/角色/值域（决定是否走阶段 2）。"""
     concepts = []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -179,7 +187,7 @@ def load_ring_concepts(csv_path: Path):
                 "range": row["值域"].strip(),
             })
     if not concepts:
-        raise ValueError(f"未在 {csv_path} 中找到环1b/2/3/4 的概念")
+        raise ValueError(f"未在 {csv_path} 中找到环1a/1b/2/3/4 的概念")
     return concepts
 
 
@@ -187,7 +195,7 @@ def load_ring_concepts(csv_path: Path):
 # 主流程
 # =============================================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="环1b/2/3/4 + S1 + CAT vLLM 推理")
+    parser = argparse.ArgumentParser(description="环1a/1b/2/3/4 + S1 + CAT vLLM 推理")
     parser.add_argument("--model_path", type=str, required=True,
                         help="模型权重目录（完整路径，如 D:/models/glm-4-9b-chat）")
     parser.add_argument("--data_path", type=str, required=True,
@@ -229,7 +237,7 @@ def main():
     sp_ab = build_sampling_params(a_ids + b_ids)
     sp_digit = build_sampling_params([t for g in digit_groups for t in g])
 
-    # ---------- 批量 1：阶段 1（29 概念）+ CAT（5 问/条） ----------
+    # ---------- 批量 1：阶段 1（35 概念）+ CAT（6 问/条） ----------
     yn_prompts, yn_keys = [], []
     for sample in dataset:
         for c in concepts:
@@ -381,7 +389,7 @@ def main():
                 "files": files,
                 "split": args.split,
                 "n_samples": len(dataset),
-                "prompt_version": "rings v1.3",
+                "prompt_version": "rings v1.4",
                 "timestamp": datetime.now().strftime("%Y%m%d-%H%M%S"),
                 "stage1_tau": tau,
                 "cat_taus": cat_taus,
