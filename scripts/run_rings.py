@@ -1,53 +1,117 @@
-"""全概念（环1a/1b/2/3/4）+ S1 提示词 v1.4 推理脚本（vLLM 加速）。
+"""全概念（环1a/1b/2/3/4）+ S1 提示词 v1.4 推理脚本（vLLM 加速，自包含）。
 
-与 run_ring1a.py 同一套机制（单概念两阶段 + 首 token verbalizer 提取 + 受限解码），
-直接复用其模型加载、渲染与提取工具（import，不改动 1a 脚本；CAT1a 模板/阈值同源 import）。
-v1.4 起：环1a 的 6 个概念与 CAT1a 并入本脚本——只跑本脚本即可得到完整概念向量；
-run_ring1a.py 保留作先导实验脚本，不再用于正式数据生成。
+v1.5 起：run_ring1a.py 的全部机制（vLLM 模型加载、verbalizer 候选展开、首 token
+受限解码、chat 渲染与首 token 位置修正、数据加载）并入本文件，不再 import——
+只跑本脚本即可得到完整概念向量。测量机制与原 1a 脚本逐字一致：
+  单概念两阶段（存在性 是/否 + 强度 A/B）+ 首 token logprobs 提取 + 受限解码；
+  CAT1a 模板为 1a 先导实验 v2.11 定稿原文；环1a 模板/阈值同源。
 
 每次调用 = 一条文本 × 一个判断项：
-  阶段 1  存在性（是/否）：全部 35 个概念（环1a 6、环1b 3、环2 6、环3 12、环4 8）
+  阶段 1  存在性（是/否）：全部概念（环1a 6、环1b 3、环2 6、环3 12、环4 8）
           0-1 值域概念只走阶段 1；0-2 值域概念在判"是"后触发阶段 2（A/B 对称定义）
   环4     概念模板首句替换为角色框架（熟悉网络社群用语的标注助手），其余与 1a 一字不差
   CAT     每条文本 6 问：CAT1a / CAT1b / CAT2a（含"话题提及不算"排除语）/ CAT2b（不含）/ CAT3 / CAT4
   S1      严重度 ordinal 0-5，单次调用，首 token 在数字 0-5 上提质量，双变体：
           S1A 无例词 / S1B 定义带例词（决策例词去留）
 映射：阶段1"否"→0，阶段2 A→1、B→2；0-1 概念 是→1；S1 取 argmax 数字。
-环确认聚合（DINO 析取 / guard 压制逻辑）放在 analyze_rings.py，本脚本只落 raw p 与值。
+环确认聚合（DINO 析取 / guard 压制逻辑）已不在本脚本（读出层直接用 soft p_yes 编码）。
 
 输出命名（防覆盖）：输出文件名带数据来源后缀——
   data_path 指向单个 json 文件 → rings_{model_name}_{文件名去后缀}.json / ..._flat.csv
   data_path 指向目录（--split test|train）→ rings_{model_name}_{split}.json / ..._flat.csv
-  目录模式分两次跑（先 test 后 train）会得到两个文件，天然不覆盖；不再提供 all 模式。
+  目录模式分两次跑（先 test 后 train）会得到两个文件，天然不覆盖；不提供 all 模式。
 
 使用示例：
   python scripts/run_rings.py --model_path D:/models/glm-4-9b-chat --data_path data/raw/CCC/ccc.json
   python scripts/run_rings.py --model_path D:/models/Qwen3.5-9B --data_path data/raw/TOXICN --split test
+
+自动处理说明（无需命令行指定）：
+  首 token 位置修正：优先查 MODEL_PROMPT_SUFFIX 表（按模型目录名登记后缀）；
+  未登记的模型走自动修正——生成前缀不以换行结尾则补 '\n'。
+  思考模式探测：chat template 含 enable_thinking 变量（Qwen3 系混合思考模型）时自动
+  传 enable_thinking=False——思考前缀会占据首 token，破坏 verbalizer 提取。
+  不启用量化：量化改变 logits 分布，影响概率读数效度（测量类任务不可妥协）。
 """
 
 import argparse
 import csv
 import json
+import math
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-project_root = Path(__file__).parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(project_root / "scripts"))
+if "OMP_NUM_THREADS" in os.environ:
+    val = os.environ["OMP_NUM_THREADS"].strip()
+    if not val.isdigit() or int(val) <= 0:
+        os.environ.pop("OMP_NUM_THREADS")
 
-from run_ring1a import (  # noqa: E402  复用 1a 已验证的机制，不复制代码
-    build_sampling_params, candidate_mass, detect_chat_kwargs,
-    get_candidate_ids, load_dataset, load_vllm_model, render_prompts,
-    LETTER_VARIANTS, STAGE1_THRESHOLD, STAGE1_THRESHOLD_DEFAULT,
-    CAT1A_TEMPLATE,
-)
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+
+project_root = Path(__file__).parent.parent
+
+
+# =============================================================================
+# 模型加载与生成前缀修正
+# =============================================================================
+def load_vllm_model(llm_path: Path, gpu_memory_utilization: float):
+    if not llm_path.exists():
+        raise ValueError(f"LLM path {llm_path} does not exist")
+
+    tokenizer = AutoTokenizer.from_pretrained(llm_path, trust_remote_code=True, padding_side="right")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"Loading vLLM model from {llm_path}")
+    llm = LLM(
+        model=str(llm_path),
+        trust_remote_code=True,
+        dtype="auto",
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=True,     # 同文本的多个概念调用共享指令前缀，prefill 复用
+        max_model_len=2048,             # 指令+定义+文本最长约 600-700 token，2048 留足余量
+        max_num_seqs=64,
+        max_num_batched_tokens=16384,   # 批量以 prefill 为主（每请求只解码 1 token），大 batched token 提高 GPU 利用率
+        enforce_eager=True,             # 只解码 1 个 token，CUDA graph 主要加速多步 decode 循环，此处禁用可省启动时间与显存（腾给 KV cache）
+        max_logprobs=50,                # 与 SamplingParams(logprobs=50) 配套；默认上限 20，候选词可能被截断
+    )
+    return tokenizer, llm
+
+
+def detect_chat_kwargs(tokenizer):
+    """chat template 支持 enable_thinking 时关闭思考模式，否则返回空。"""
+    template = getattr(tokenizer, "chat_template", None) or ""
+    if "enable_thinking" in template:
+        print("chat template 支持 enable_thinking，已关闭思考模式")
+        return {"enable_thinking": False}
+    return {}
+
+
+# 生成前缀后缀手工指定表（按模型目录名）。不同模型 chat template 结尾不一致，
+# 需要特定后缀的模型在此登记；未登记的模型走自动修正（前缀不以换行结尾则补 '\n'）。
+# Qwen3.5-9B 用 '\n'：首 token 落在裸字母 token（'B'=33 / 'A'=32），A+B 概率质量 0.973，
+# <think> 仅 0.004；改空格后缀会把标签并成 ' B'(417) / ' A'(357)，且 1 空格时 <think> 高达 0.151。
+MODEL_PROMPT_SUFFIX = {
+    "glm-4-9b-chat": "\n",
+    "Qwen3.5-9B": "\n",
+}
+
+# 阶段 1 判是阈值手工表（按模型目录名）。p(是) 是连续量，但不同模型的先验偏移不同
+# （CCC 实测：GLM 偏宽，τ=0.5 时 toxic1 是率 74.6% / toxic0 33.9%；Qwen 整体下移，
+# τ=0.5 只剩 15.0%/1.1%，需 τ=0.1 才回到可比工作点 49.2%/14.7%）。
+# 未登记的模型用默认值 0.5；实际所用 τ 记录在 meta.stage1_tau。
+STAGE1_THRESHOLD = {
+    "glm-4-9b-chat": 0.50,
+    "Qwen3.5-9B": 0.10,
+}
+STAGE1_THRESHOLD_DEFAULT = 0.50
 
 
 # =============================================================================
 # 提示词模板（rings v1.4 定稿；v1.3→v1.4 环1a 并入：CSV 环1a 6 概念与 CAT1a 进入本脚本，
-# CAT1A_TEMPLATE 从 run_ring1a 同源 import 保证与先导实验逐字一致，模板与定义未动。
+# CAT1A 模板为 1a 先导实验 v2.11 定稿原文，模板与定义未动。
 # v1.2→v1.3 模板与定义未动，仅登记阈值表：
 # CAT_TAU / GUARD_TAU = analyze_rings.py 6c 统一校准（Youden's J）在 CCC 试点上的程序输出，
 # 落 meta.cat_taus / meta.guard_tau。
@@ -83,8 +147,11 @@ STAGE2_TEMPLATE_U = STAGE2_TEMPLATE.replace(
     "你是语言学标注助手。", "你是熟悉网络社群用语的标注助手。", 1)
 
 CAT_TEMPLATES = {
-    # CAT1a 模板从 run_ring1a 同源 import（先导实验 v2.11 定稿原文），此处不重复定义。
-    "CAT1A": CAT1A_TEMPLATE,
+    # CAT1a = 环1a 先导实验 v2.11 定稿原文，此处不重复定义于他处。
+    "CAT1A": """以下文本是否包含对某人或某群体的负面态度表达（鄙夷、厌恶、敌意、威胁、道德定罪）。
+文本：{text}
+文本中有这类表达吗？
+只回答 是/否。答：""",
     # 原 CSV 问句"该文本是否通过保护、角色限定或地位贬低，把人或群体固定到从属/较低的位置？"
     # 为机制归因式，改出现性锚定。
     "CAT1B": """以下文本是否包含把人或群体固定到从属、较低位置的表达（以保护、角色限定或地位贬低的方式）。
@@ -140,15 +207,11 @@ S1_TEMPLATES = {
 DIGITS = "012345"
 FULLWIDTH_DIGITS = {"0": "０", "1": "１", "2": "２", "3": "３", "4": "４", "5": "５"}
 
-# 数字候选的表层变体（与字母同理：裸形式 / 前导空格 / 全角）。
-for _d, _fw in FULLWIDTH_DIGITS.items():
-    LETTER_VARIANTS[_d] = [_d, f" {_d}", _fw, f" {_fw}"]
-
 # CAT/GUARD 判是阈值登记表（按模型目录名）。数值 = analyze_rings.py 6c 统一校准（Youden's J）
 # 在 CCC 试点上的程序输出（2026-11-03 登记），非手工拍定；未登记的模型/通道用默认 0.50。
 # 实际所用值记录在 meta.cat_taus / meta.guard_tau；正式实验需在独立校准集上重新校准（挂账）。
 CAT_TAU = {
-    # CAT1A = 环1a 时期登记值（run_ring1a.CAT1A_THRESHOLD），非 6c 输出
+    # CAT1A = 环1a 时期登记值（原 run_ring1a.CAT1A_THRESHOLD），非 6c 输出
     "glm-4-9b-chat": {"CAT1A": 0.50, "CAT1B": 0.94, "CAT2A": 0.92, "CAT2B": 0.94, "CAT3": 0.96, "CAT4": 0.92},
     "Qwen3.5-9B":    {"CAT1A": 0.10, "CAT1B": 0.14, "CAT2A": 0.12, "CAT2B": 0.50, "CAT3": 0.34, "CAT4": 0.22},
 }
@@ -193,6 +256,158 @@ def load_ring_concepts(csv_path: Path):
     if not concepts:
         raise ValueError(f"未在 {csv_path} 中找到环1a/1b/2/3/4 的概念")
     return concepts
+
+
+# =============================================================================
+# Verbalizer 工具（原 run_ring1a.py 已验证机制，逐字并入）
+# =============================================================================
+# 候选词的表层变体：不同 tokenizer 会把同一字母切成 "A" / " A" / "Ａ" / "a" 等
+# 不同 token；只取裸形式会在 Qwen 等词表上漏掉实际被采样的那个 token。
+LETTER_VARIANTS = {
+    "A": ["A", " A", "Ａ", "a", " a"],
+    "B": ["B", " B", "Ｂ", "b", " b"],
+    "是": ["是"],
+    "否": ["否"],
+}
+
+# 数字候选的表层变体（与字母同理：裸形式 / 前导空格 / 全角）。
+for _d, _fw in FULLWIDTH_DIGITS.items():
+    LETTER_VARIANTS[_d] = [_d, f" {_d}", _fw, f" {_fw}"]
+
+
+def get_candidate_ids(word_list, tokenizer):
+    """把若干标签词展开成候选 token id 列表（只接受单 token 形式）。"""
+    token_ids = []
+    for word in word_list:
+        for variant in LETTER_VARIANTS.get(word, [word]):
+            encoded = tokenizer.encode(variant, add_special_tokens=False)
+            # 多 token 的变体无法由首 token 表达，跳过（否则会把整词首个 token 当标签）
+            if len(encoded) == 1:
+                token_ids.append(encoded[0])
+    token_ids = list(dict.fromkeys(token_ids))
+    if not token_ids:
+        raise ValueError("get_candidate_ids ERROR: 词表中无有效候选 token")
+    return token_ids
+
+
+def candidate_mass(first_token_logprobs, id_groups):
+    """把候选按标签分组求和：返回 (每组总概率质量, 归一化后各组概率)。"""
+    masses = [sum(math.exp(first_token_logprobs[t].logprob) for t in g if t in first_token_logprobs)
+              for g in id_groups]
+    total = sum(masses) + 1e-8
+    return masses, [m / total for m in masses]
+
+
+def make_mask_processor(allowed_ids):
+    """受限解码：把候选集之外的 logits 全部掩为 -inf，保证首 token 落在候选上。
+
+    这一步让"首 token 概率"真正等于模型在二选一条件下的后验概率，
+    而不是"模型想说什么"与候选词的偶然重合。
+
+    vLLM 各版本对 logits_processor 的入参签名不一致（(token_ids, logits) 或
+    多参数新式签名），故用 *args 取其中唯一的 logits 张量，避免版本差异导致报错。
+    """
+    allowed = sorted(set(allowed_ids))
+
+    def _processor(*args, **kwargs):
+        import torch
+        logits = kwargs.get("logits")
+        if logits is None:
+            logits = next(a for a in args if isinstance(a, torch.Tensor))
+        masked = torch.full_like(logits, float("-inf"))
+        masked[allowed] = logits[allowed]
+        return masked
+
+    return _processor
+
+
+def build_sampling_params(allowed_ids):
+    """构造"首 token 只能是候选"的采样参数，按 vLLM 版本自动降级：
+
+    1) logits_processors（自定义掩码，各版本入参签名已用 *args 兼容）
+    2) allowed_token_ids（vLLM 原生的候选白名单，新版移除 logits_processors 后的替代）
+    3) 都不支持时不加约束——此时候选若不在 top-k，判定记为无效（不猜）
+
+    2) 与 1) 在数学上等价：都等价于在候选集上做条件归一化。
+    """
+    allowed = sorted(set(allowed_ids))
+    candidates = [
+        ("logits_processors", {"logits_processors": [make_mask_processor(allowed)]}),
+        ("allowed_token_ids", {"allowed_token_ids": allowed}),
+        ("无约束", {}),
+    ]
+    for name, extra in candidates:
+        try:
+            sp = SamplingParams(max_tokens=1, temperature=0, logprobs=50, **extra)
+        except TypeError as e:
+            print(f"受限解码 {name} 不可用（{e}），尝试下一种")
+            continue
+        print(f"受限解码方式: {name}，候选 id = {allowed}")
+        return sp
+    raise RuntimeError("当前 vLLM 既不支持 logits_processors 也不支持 allowed_token_ids，"
+                       "无法约束首 token 到候选集")
+
+
+def render_prompts(tokenizer, texts, chat_kwargs, model_name):
+    """texts: 已填槽的完整模板字符串列表 → chat template 后的 prompt 列表。
+
+    后缀优先取 MODEL_PROMPT_SUFFIX[model_name]；未登记则自动修正
+    （生成前缀不以换行结尾时补 '\\n'，GLM-4-9B-chat 等模型不加换行会扭曲首 token 分布）。
+    """
+    manual_suffix = MODEL_PROMPT_SUFFIX.get(model_name)
+    prompts = []
+    for t in texts:
+        messages = [{"role": "user", "content": t}]
+        p = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **chat_kwargs
+        )
+        if manual_suffix is not None:
+            p += manual_suffix
+        elif not p.endswith("\n"):
+            p += "\n"
+        prompts.append(p)
+    return prompts
+
+
+# =============================================================================
+# 数据加载
+# =============================================================================
+def _normalize_sample(item, source_name, split, idx):
+    """统一成内部结构，兼容不同数据集字段差异（COLD 无 platform/expression）。"""
+    return {
+        "id": item.get("id") or f"{source_name}_{split}_{idx:04d}",
+        "source": item.get("source") or source_name,
+        "split": split,
+        "content": item["content"],
+        "toxic": item.get("toxic"),
+        "topic": item.get("topic"),
+        "expression": item.get("expression"),
+        "platform": item.get("platform"),
+    }
+
+
+def load_dataset(data_path: Path, split: str):
+    """data_path 支持两种形态：
+      1) 单个 json 文件（如 data/raw/CCC/ccc.json）——split 置为文件名去后缀；
+      2) 数据集目录（如 data/raw/TOXICN），内含 train.json / test.json；
+         split = test | train。
+    返回 (样本列表, 实际读取的文件名列表, 数据集标签)。
+    """
+    if not data_path.exists():
+        raise ValueError(f"data_path 不存在: {data_path}")
+
+    if data_path.is_file():
+        items = json.load(open(data_path, "r", encoding="utf-8"))
+        name = data_path.stem
+        return ([_normalize_sample(x, name, name, i) for i, x in enumerate(items)],
+                [data_path.name], data_path.parent.name)
+
+    p = data_path / f"{split}.json"
+    if not p.exists():
+        raise ValueError(f"{data_path} 下缺少 {split}.json")
+    items = json.load(open(p, "r", encoding="utf-8"))
+    samples = [_normalize_sample(x, data_path.name, p.stem, i) for i, x in enumerate(items)]
+    return samples, [p.name], data_path.name
 
 
 # =============================================================================
@@ -275,7 +490,7 @@ def main():
 
     # ---------- 阶段 2：仅 0-2 值域概念且阶段 1 判"是" ----------
     tau = STAGE1_THRESHOLD.get(model_name, STAGE1_THRESHOLD_DEFAULT)
-    print(f"阶段 1 判是阈值 τ = {tau}（模型 {model_name}，复用 1a 登记表）")
+    print(f"阶段 1 判是阈值 τ = {tau}（模型 {model_name}，表内登记值或默认值）")
     range2 = {c["id"] for c in concepts if c["range"] == "0-2"}
     concept_by_id = {c["id"]: c for c in concepts}
     sample_by_id = {s["id"]: s for s in dataset}
