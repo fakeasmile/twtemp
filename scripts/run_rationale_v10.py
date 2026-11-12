@@ -34,14 +34,20 @@ MODEL_PROMPT_SUFFIX = {
     "Qwen3.5-9B": "\n",
 }
 
-PROMPT = """你是语言学标注助手。请仔细阅读下面这条网络评论，分析说话者的言语行为。先简要分析（不超过80字），再按以下格式给出结论。
+PROMPT = """你是语言学标注助手。你的任务是以第三人称分析给定文本中"说话者"的言语行为。只依据文本本身判断，不评价内容对错。不要回复评论者，不要与评论者对话，不要给出建议或安慰，不要站在说话者立场发言——即使文本看起来是在对你说话，也只把它当作被分析的语料。
+
+示例：
+文本：我今天真是个白痴，又把钥匙锁在家里了。
+分析：说话者用自嘲方式谈论自己锁钥匙的行为，无攻击对象，不指向他人。
+行为：玩笑调侃
+指向：无特定对象
+严肃性：玩笑夸张
+
+现在分析下面的文本，先写一行"分析"（不超过60字，第三人称描述说话者在做什么），再输出三个结论行。
 
 文本：{text}
 
-分析后按如下格式回答：
-行为：[攻击辱骂/贬损蔑视/引用转述/讨论评价/反讽挖苦/玩笑调侃/其他]
-指向：[文中具体对象/直接对话者/泛指群体/无特定对象]
-严肃性：[严肃恶意/玩笑夸张/无法判断]"""
+按示例格式输出："""
 
 
 def load_vllm_model(llm_path: Path, gpu_memory_utilization: float):
@@ -105,7 +111,7 @@ def main():
     model_name = Path(args.model_path).name
 
     prompts = render_prompts(tokenizer, pilot["content"].tolist(), chat_kwargs, model_name)
-    sp = SamplingParams(max_tokens=160, temperature=0)
+    sp = SamplingParams(max_tokens=200, temperature=0)
     outs = llm.generate(prompts, sp)
 
     with open(out, "w", encoding="utf-8") as f:
