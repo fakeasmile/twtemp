@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 try:
     from tqdm import tqdm
@@ -62,7 +62,11 @@ def extract(model, tok, texts, hidden_size, batch_size, max_length, desc):
         enc = tok(chunk, return_tensors="pt", padding=True, truncation=True,
                   max_length=max_length).to(model.device)
         out = model(**enc, output_hidden_states=True, use_cache=False)
-        h = out.hidden_states[-1].float().cpu().numpy()          # (B, L, H)
+        # last_hidden_state = 过最终 layer norm 的末层输出（RoBERTa CLS 对应物）；
+        # 老 remote-code 返回 dict/对象均兼容
+        h = (out.last_hidden_state if hasattr(out, "last_hidden_state")
+             and out.last_hidden_state is not None
+             else out.hidden_states[-1]).float().cpu().numpy()   # (B, L, H)
         m = enc["attention_mask"].float().cpu().numpy()[..., None]
         last[s:s + len(chunk)] = h[:, -1, :].astype(np.float16)
         mean[s:s + len(chunk)] = ((h * m).sum(1) / m.sum(1)).astype(np.float16)
@@ -93,10 +97,12 @@ def main():
     stamp("[加载] 模型与 tokenizer...")
     dt = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    # AutoModel = ChatGLMModel 主体（无 lm_head）：v15 只需末层隐状态，
+    # 且绕开新 transformers 对 CausalLM remote-code 绑定权重加载的不兼容。
+    model = AutoModel.from_pretrained(
         args.model_path, torch_dtype=dt, trust_remote_code=True).cuda().eval()
     hidden_size = model.config.hidden_size
-    stamp(f"[加载] hidden_size={hidden_size} dtype={args.dtype}")
+    stamp(f"[加载] {type(model).__name__} hidden_size={hidden_size} dtype={args.dtype}")
 
     npz_payload = {}
     for split, ids, texts in (("train", tr["id"].values, texts_tr),
