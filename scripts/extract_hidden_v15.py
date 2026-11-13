@@ -73,6 +73,31 @@ def extract(model, tok, texts, hidden_size, batch_size, max_length, desc):
     return last[inv], mean[inv]
 
 
+def patch_tied_weights_attr() -> None:
+    """远端新 transformers + ChatGLM remote-code 的已知不兼容：
+    _move_missing_keys_from_meta_to_device 读取 self.all_tied_weights_keys，
+    而 remote-code 动态类未设置该属性。此处给 PreTrainedModel 打方法补丁，
+    属性缺失时注入空 dict 后调用原方法。版本容忍：本地旧版无该方法则
+    零操作；已打过补丁则幂等返回。对 v15 无副作用：只消费 transformer
+    主体隐状态；若 lm_head 因绑定键处理变化而未被正确加载，logits 会
+    错，但隐状态不受任何影响。"""
+    try:
+        from transformers import modeling_utils as _mu
+        _orig = _mu.PreTrainedModel._move_missing_keys_from_meta_to_device
+    except AttributeError:
+        return  # 该 transformers 版本无此方法，无需补丁
+    if getattr(_orig, "_v15_patched", False):
+        return
+
+    def _patched(self, *a, **k):
+        if not hasattr(self, "all_tied_weights_keys"):
+            self.all_tied_weights_keys = {}
+        return _orig(self, *a, **k)
+
+    _patched._v15_patched = True
+    _mu.PreTrainedModel._move_missing_keys_from_meta_to_device = _patched
+
+
 def main():
     ap = argparse.ArgumentParser(description="v15 GLM 末层隐状态抽取")
     ap.add_argument("--model_path", required=True)
@@ -95,6 +120,7 @@ def main():
     stamp(f"[加载] train n={len(texts_tr)} / test n={len(texts_te)}")
 
     stamp("[加载] 模型与 tokenizer...")
+    patch_tied_weights_attr()
     dt = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     # AutoModel = ChatGLMModel 主体（无 lm_head）：v15 只需末层隐状态，
@@ -125,8 +151,10 @@ def main():
                  bare_mean=bm, chat_last=cl)
         stamp(f"[导出] hidden_{split}.npz 完成 ({bl.shape})")
 
+    import transformers as _tf
     meta = {"model_name": args.model_name, "model_path": args.model_path,
             "hidden_size": hidden_size, "dtype": args.dtype,
+            "transformers_version": _tf.__version__,
             "max_length": args.max_length, "batch_size": args.batch_size,
             "layer": -1, "pooling": ["bare_last", "bare_mean", "chat_last"],
             "n_train": len(texts_tr), "n_test": len(texts_te)}
