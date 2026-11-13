@@ -82,7 +82,12 @@ def extract_all_layers(model, tok, texts, hidden_size, batch_size,
                   max_length=max_length).to(model.device)
         out = model(**enc, output_hidden_states=True, use_cache=False)
         hs = list(out.hidden_states)                       # L 个 (B, seq, H)
-        hs.append(out.last_hidden_state)                   # 末槽锚定
+        # 远端 GLM-4 的 auto_map 把 AutoModel 映射到 ChatGLMForConditionalGeneration，
+        # 输出为 CausalLMOutputWithPast：无 last_hidden_state。末槽锚定回退用
+        # hidden_states[-1]（与 extract_hidden_v15 的回退逻辑一致，保持 v15 口径）
+        lhs = (out.last_hidden_state if hasattr(out, "last_hidden_state")
+               and out.last_hidden_state is not None else hs[-1])
+        hs.append(lhs)                                     # 末槽锚定
         # 各层末位置堆叠 → (B, L_total, H)
         stack = torch.stack([h[:, -1, :] for h in hs], dim=1)
         if layers_arr is None:
