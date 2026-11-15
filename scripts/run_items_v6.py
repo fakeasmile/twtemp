@@ -19,9 +19,9 @@ v6 心理测量学架构的测量层：读 cbm_concept_set_v6.csv 的 152 条条
 条目问句 + 例词已构成完整操作性定义，见设计文档 §3 规则 5）。
 
 输出（防覆盖）：
-  data/processed/<数据集>/<model_name>_seed{N}/items_{model_name}_{split}.json
+  data/processed/<数据集>/v6_<model_name>/items_v6_<model_name>_{split}.json
     —— 全量明细：每样本 × 每条目的 p_yes；无效判定单独登记（含首 token）。
-  同目录 items_{model_name}_{split}_matrix.csv
+  同目录 items_v6_{model_name}_{split}_matrix.csv
     —— 宽表矩阵：每行一个样本（id/toxic/content + 152 列条目 p_yes），
        条目分析与聚合读出脚本直接读这张表。
 双教师 = 同一脚本换 --model_path 跑两次（GLM-4-9B-Chat 主测 + Qwen3.5-9B 复测）。
@@ -278,9 +278,9 @@ def parse_args():
     parser.add_argument("--items_csv", type=str,
                         default=str(project_root / "data" / "concepts" / "cbm_concept_set_v6.csv"))
     parser.add_argument("--seed", type=int, default=42,
-                        help="随机种子（temperature=0 下主要作运行批次登记，进输出目录名防覆盖）")
+                        help="随机种子（temperature=0 下仅登记进 meta，不影响测量值与输出目录名）")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="默认 data/processed/<数据集>/<model_name>_seed{N}/")
+                        help="默认 data/processed/<数据集>/v6_<model_name>/")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     return parser.parse_args()
 
@@ -334,11 +334,11 @@ def main():
 
     # ---------- 保存 ----------
     out_dir = (Path(args.output_dir) if args.output_dir
-               else project_root / "data" / "processed" / dataset_tag / f"{model_name}_seed{args.seed}")
+               else project_root / "data" / "processed" / dataset_tag / f"v6_{model_name}")
     out_dir.mkdir(parents=True, exist_ok=True)
     name_suffix = (Path(args.data_path).stem if Path(args.data_path).is_file()
                    else args.split)
-    json_path = out_dir / f"items_{model_name}_{name_suffix}.json"
+    json_path = out_dir / f"items_v6_{model_name}_{name_suffix}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({
             "meta": {
@@ -362,7 +362,7 @@ def main():
         }, f, ensure_ascii=False)  # 紧凑输出（train × 152 体量大，不用 indent）
 
     # 宽表矩阵 CSV（条目分析/聚合读出直接读这张表）
-    csv_path = out_dir / f"items_{model_name}_{name_suffix}_matrix.csv"
+    csv_path = out_dir / f"items_v6_{model_name}_{name_suffix}_matrix.csv"
     item_ids = [it["item_id"] for it in items]
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)

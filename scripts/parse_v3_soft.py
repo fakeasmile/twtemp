@@ -15,7 +15,7 @@ s2_cids 触发集 + 后续方差过滤）。列前缀：
   s1b_p0..5  样本级 S1B 六档概率
   cat_<k>    CAT 六通道 p_yes（CAT1A/CAT1B/CAT2A/CAT2B/CAT3/CAT4 中存在者）
 
-输出：data/processed/TOXICN/glm-4-9b-chat_v3/v3_soft_{train,test}_matrix.csv
+输出：data/processed/TOXICN/v3_glm-4-9b-chat/v3_soft_{train,test}_matrix.csv
 """
 
 import argparse
@@ -64,7 +64,7 @@ def parse_one(json_path: Path) -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser(description="解析 v3 rings JSON 为 soft 完整宽表")
-    ap.add_argument("--v3_dir", default="data/processed/TOXICN/glm-4-9b-chat_v3")
+    ap.add_argument("--v3_dir", default="data/processed/TOXICN/v3_glm-4-9b-chat")
     ap.add_argument("--model_name", default="glm-4-9b-chat",
                     help="rings 文件名中的模型名（如 Qwen3.5-9B）")
     args = ap.parse_args()

@@ -286,9 +286,9 @@ def parse_args():
     parser.add_argument("--items_csv", type=str,
                         default=str(project_root / "data" / "concepts" / "cbm_concept_set_v7.csv"))
     parser.add_argument("--seed", type=int, default=42,
-                        help="随机种子（temperature=0 下主要作运行批次登记，进输出目录名防覆盖）")
+                        help="随机种子（temperature=0 下仅登记进 meta，不影响测量值与输出目录名）")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="默认 data/processed/<数据集>/<model_name>_seed{N}/")
+                        help="默认 data/processed/<数据集>/v7_<model_name>/")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     parser.add_argument("--limit", type=int, default=None,
                         help="只测前 N 个样本（冒烟/试点用；全量运行不传）")
@@ -340,7 +340,7 @@ def main():
     mass_sum = 0.0        # 是+否 原始概率质量之和（受限解码正常时应=1）
     mass_ge_999 = 0       # cand_mass >= 0.999 的推理数
     out_dir = (Path(args.output_dir) if args.output_dir
-               else project_root / "data" / "processed" / dataset_tag / f"{model_name}_seed{args.seed}")
+               else project_root / "data" / "processed" / dataset_tag / f"v7_{model_name}")
     out_dir.mkdir(parents=True, exist_ok=True)
     name_suffix = (Path(args.data_path).stem if Path(args.data_path).is_file()
                    else args.split)
