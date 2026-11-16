@@ -28,13 +28,19 @@
 test 仅训练完成后评估一次。全程只有一个总进度条，postfix 实时报告
 当前训练每轮的验证宏F1/Acc。
 
-产物：results/flat3/v7/<arm>_<clf>/{selection.csv, test_eval.csv, metrics.txt}
-      results/flat3/v7/summary_all.csv
+产物：results/flat3/v7/<arm>_<clf>/{selection.csv, test_eval.csv, test_predictions.csv,
+      metrics.txt}，results/flat3/v7/summary_all.csv
+  test_predictions.csv = 逐样本预测（每臂×分类器 5 轮 × 2411 test 样本），列含
+  repeat/seed/alpha/tau/id/y_true/p_model/y_pred/toxic_type/expression/platform/
+  topic/content，供后续按 TOXICN 标注体系（toxic_type、expression 等）做分组
+  正确率分析。id 后缀号 = data/raw/TOXICN/test.json 行号（已验证 content 全等），
+  toxic_type/expression 直接从 raw json 对齐写入，无需二次 join。
 
 运行（本机，toxicnew 环境）：D:/miniconda3/envs/toxicnew/python.exe scripts/readout_flat3_v7.py
 """
 
 import argparse
+import json
 import re
 import secrets
 from pathlib import Path
@@ -81,6 +87,7 @@ EVASION_LEX = ("朲", "亽", "㐺", "亻", "怹")
 TRAIN_CSV = PROJECT_ROOT / "data/processed/TOXICN/v7_glm-4-9b-chat/items_v7_glm-4-9b-chat_train_matrix.csv"
 TEST_CSV = PROJECT_ROOT / "data/processed/TOXICN/v7_glm-4-9b-chat/items_v7_glm-4-9b-chat_test_matrix.csv"
 ITEMS_CSV = PROJECT_ROOT / "data/concepts/cbm_concept_set_v7.csv"
+RAW_TEST_JSON = PROJECT_ROOT / "data/raw/TOXICN/test.json"  # toxic_type/expression 等标注体系
 
 ARMS = ["arm1_flat", "arm2_v81", "arm3_construct"]
 CLFS = ["fc", "mlp"]
@@ -329,6 +336,22 @@ def main():
     yte = te["toxic"].astype(int).values
     print(f"v7: train {len(tr)} / test {len(te)}，条目 {len(feat_cols)}，构念 {len(mapping)} 个")
 
+    # ---- TOXICN raw 标注体系对齐（id 后缀号 = raw test.json 行号）----
+    raw_te = json.loads(RAW_TEST_JSON.read_text(encoding="utf-8"))
+    assert len(raw_te) == len(te), \
+        f"[FATAL] raw test.json {len(raw_te)} 条 != 矩阵 test {len(te)} 条"
+    te_ids = te["id"].tolist()
+    te_contents = te["content"].tolist()
+    for i, c in zip(te_ids, te_contents):
+        assert raw_te[int(str(i).rsplit("_", 1)[-1])]["content"] == str(c), \
+            f"[FATAL] 矩阵 id {i} 与 raw test.json 行 content 不一致"
+    te_meta = {
+        "toxic_type": [raw_te[int(str(i).rsplit("_", 1)[-1])]["toxic_type"] for i in te_ids],
+        "expression": [raw_te[int(str(i).rsplit("_", 1)[-1])]["expression"] for i in te_ids],
+        "platform": [raw_te[int(str(i).rsplit("_", 1)[-1])]["platform"] for i in te_ids],
+        "topic": [raw_te[int(str(i).rsplit("_", 1)[-1])]["topic"] for i in te_ids],
+    }
+
     n_trainings = len(ARMS) * len(CLFS) * args.n_repeats * len(ALPHA_GRID)
     global_bar = tqdm(total=n_trainings * MAX_EPOCHS, desc="flat3-v7", dynamic_ncols=True)
 
@@ -338,7 +361,7 @@ def main():
             tag = f"{arm}_{clf}"
             out_dir = out_root / tag
             out_dir.mkdir(parents=True, exist_ok=True)
-            sel_rows, test_rows = [], []
+            sel_rows, test_rows, pred_rows = [], [], []
             for rep in range(args.n_repeats):
                 seed = secrets.randbits(31)  # 每轮随机生成种子，写入结果
                 tr_sub, va_sub = train_test_split(
@@ -397,9 +420,24 @@ def main():
                 test_rows.append(row)
                 summary_rows.append({"set": "v7", "arm": arm, "clf": clf, **row})
 
+                # ---- 逐样本预测（含 raw 标注体系列，供分组正确率分析）----
+                for k in range(len(te)):
+                    pred_rows.append({
+                        "repeat": rep, "seed": seed, "alpha": alpha_star,
+                        "tau": tau_star, "id": te_ids[k],
+                        "y_true": int(yte[k]),
+                        "p_model": round(float(pte[k]), 4),
+                        "y_pred": int(pred[k]),
+                        "toxic_type": te_meta["toxic_type"][k],
+                        "expression": te_meta["expression"][k],
+                        "platform": te_meta["platform"][k],
+                        "topic": te_meta["topic"][k],
+                        "content": te_contents[k]})
+
             pd.DataFrame(sel_rows).to_csv(out_dir / "selection.csv", index=False)
             tdf = pd.DataFrame(test_rows)
             tdf.to_csv(out_dir / "test_eval.csv", index=False)
+            pd.DataFrame(pred_rows).to_csv(out_dir / "test_predictions.csv", index=False)
 
             # ---- metrics.txt 汇总 ----
             lines = [
