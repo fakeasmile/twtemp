@@ -127,6 +127,7 @@ def candidate_ids(tokenizer, word):
 
 
 def build_sampling_params(allowed_ids):
+    from vllm import SamplingParams
     allowed = sorted(set(allowed_ids))
     def processor(*args, **kwargs):
         import torch
