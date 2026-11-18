@@ -42,7 +42,7 @@ def main():
   if r.concept_id=='L2': definition='判断文本作者是否在当前语境中使用谐音、拼写替换、拆字、缩写或其他词汇变形作为攻击/贬损表达。只出现变体词、讨论其含义、引用批评、词典/研究/中性语境，不算作者当前实施变体攻击。一般攻击但未使用词汇变体，应判否。'
   else: definition='判断文本作者是否在当前语境中把身份标签用于贬低、羞辱、排斥或攻击他人/群体。中性提及、自我身份描述、引用批评、科普或研究讨论不算当前作者实施身份攻击。一般辱骂但未使用身份标签，应判否。'
   prompts.append(f'你是中文语用概念标注员。根据以下定义判断文本中概念是否成立。\n概念定义：{definition}\n请只输出一个字符：{a.yes_token}、{a.no_token}、{a.uncertain_token}。{a.yes_token}=满足定义；{a.no_token}=不满足定义；{a.uncertain_token}=信息不足或无法确定。不要解释。\n文本：{r.text}\n回答：')
- llm=LLM(model=a.model_path,trust_remote_code=True,gpu_memory_utilization=a.gpu_memory_utilization,max_model_len=a.max_model_len,max_num_seqs=a.batch_size)
+ llm=LLM(model=a.model_path,trust_remote_code=True,gpu_memory_utilization=a.gpu_memory_utilization,max_model_len=a.max_model_len,max_num_seqs=a.batch_size,max_logprobs=50)
  sp=SamplingParams(temperature=0,max_tokens=1,logprobs=50)
  outputs=llm.generate(prompts,sp)
  result=[]; audit=[]
